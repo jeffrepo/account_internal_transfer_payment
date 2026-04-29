@@ -15,7 +15,7 @@ class AccountPayment(models.Model):
         string="Diario de destino",
         check_company=True,
         copy=False,
-        domain="[(\'type\', \'in\', (\'bank\', \'cash\')), (\'company_id\', \'=\', company_id)]",
+        domain="[('type', 'in', ('bank', 'cash')), ('company_id', '=', company_id)]",
     )
     paired_internal_transfer_payment_id = fields.Many2one(
         "account.payment",
@@ -111,6 +111,28 @@ class AccountPayment(models.Model):
             vals["destination_account_id"] = transfer_account.id
         return vals
 
+    def _get_transfer_lines_to_reconcile(self, pair_payment):
+        self.ensure_one()
+        transfer_account = self._get_internal_transfer_account()
+        if not transfer_account or not self.move_id or not pair_payment.move_id:
+            return self.env["account.move.line"]
+
+        candidate_lines = (self.move_id.line_ids | pair_payment.move_id.line_ids).filtered(
+            lambda line: line.account_id == transfer_account
+            and not line.reconciled
+            and line.parent_state == "posted"
+        )
+        if len(candidate_lines) < 2:
+            return self.env["account.move.line"]
+
+        return candidate_lines
+
+    def _reconcile_internal_transfer_pair(self):
+        for rec in self.filtered(lambda p: p.is_internal_transfer and p.paired_internal_transfer_payment_id):
+            lines = rec._get_transfer_lines_to_reconcile(rec.paired_internal_transfer_payment_id)
+            if lines:
+                lines.reconcile()
+
     def _create_paired_internal_transfer_payment_fallback(self):
         for rec in self.filtered(lambda p: p.is_internal_transfer and not p.paired_internal_transfer_payment_id and p.state == "posted"):
             pair_vals = rec._prepare_internal_transfer_pair_vals()
@@ -123,6 +145,7 @@ class AccountPayment(models.Model):
             pair.write({
                 "paired_internal_transfer_payment_id": rec.id,
             })
+            rec._reconcile_internal_transfer_pair()
 
     def action_post(self):
         res = super().action_post()
@@ -132,11 +155,12 @@ class AccountPayment(models.Model):
         for rec in transfers:
             core_method = getattr(rec, "_create_paired_internal_transfer_payment", None)
             if callable(core_method):
-                before_pairs = rec.paired_internal_transfer_payment_id
+                before_pair = rec.paired_internal_transfer_payment_id
                 core_method()
                 rec.invalidate_recordset(["paired_internal_transfer_payment_id"])
-                if rec.paired_internal_transfer_payment_id or before_pairs:
+                if rec.paired_internal_transfer_payment_id or before_pair:
                     rec.internal_transfer_pair_created = True
+                    rec._reconcile_internal_transfer_pair()
                     continue
             rec._create_paired_internal_transfer_payment_fallback()
         return res
