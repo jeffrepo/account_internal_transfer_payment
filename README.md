@@ -1,15 +1,32 @@
 # account_internal_transfer_payment
 
-Primer borrador funcional para Odoo 19 que reintroduce la experiencia de transferencia interna desde la pantalla de pagos, similar a Odoo 15.
+Primer borrador funcional para Odoo 19.
 
-## Incluye
-- Checkbox **Transferencia interna** en `account.payment`
-- Campo **Diario de destino** en el formulario de pagos
-- Creacion automatica del pago espejo en el diario destino
-- Conciliacion automatica de las lineas de la cuenta puente de transferencias internas
-- Uso de las cuentas configuradas en cada diario para los apuntes del pago, dejando la cuenta puente para conciliacion entre ambos movimientos
+## Objetivo
+Recuperar una experiencia parecida a Odoo 15 en la pantalla de pagos:
+- checkbox de transferencia interna
+- diario origen
+- diario destino
+- generacion de pago espejo cuando se publica
 
-## Notas
-- La cuenta puente se toma desde la configuracion de la compania si existe en el core.
-- Las cuentas bancarias / transitorias siguen siendo las que Odoo resuelva desde la configuracion del diario y del metodo de pago.
-- Este modulo es una base para ajustar segun la implementacion real del repositorio y los cambios de Odoo 19.
+## Alcance actual
+- agrega campos a `account.payment`
+- agrega vista heredada del formulario de pagos
+- valida que origen y destino sean diarios tipo banco/caja de la misma compania
+- intenta reutilizar el metodo nativo `_create_paired_internal_transfer_payment` si existe en el core
+- si el core no genera el par, intenta una creacion fallback
+
+## Pendientes probables de afinacion
+- compatibilidad exacta con la vista final de Odoo 19 del cliente
+- monedas distintas entre diario origen y destino
+- cancelacion/reversion segun el flujo contable final del proyecto
+- restricciones adicionales de conciliacion
+- pruebas sobre staging
+
+## Instalacion
+1. Copiar el modulo a la ruta de addons personalizados.
+2. Actualizar lista de aplicaciones.
+3. Instalar `Account Internal Transfer Payment`.
+
+## Nota
+Este paquete es una base inicial para iterar. En ambientes reales conviene probarlo primero en staging.
