@@ -1,5 +1,7 @@
-from odoo import _, api, fields, models
-from odoo.exceptions import ValidationError
+from odoo import api, fields, models, _
+from odoo.exceptions import ValidationError, UserError
+from markupsafe import Markup
+
 
 
 class AccountPayment(models.Model):
@@ -8,7 +10,6 @@ class AccountPayment(models.Model):
     is_internal_transfer = fields.Boolean(
         string="Transferencia interna",
         copy=False,
-        help="Marca el pago como una transferencia interna entre diarios bancarios o de caja de la misma compania.",
     )
     destination_journal_id = fields.Many2one(
         "account.journal",
@@ -19,13 +20,13 @@ class AccountPayment(models.Model):
     )
     paired_internal_transfer_payment_id = fields.Many2one(
         "account.payment",
-        string="Pago espejo de transferencia interna",
+        string="Pago espejo",
         copy=False,
         readonly=True,
         check_company=True,
     )
     internal_transfer_pair_created = fields.Boolean(
-        string="Par interno creado",
+        string="Par creado",
         default=False,
         copy=False,
         readonly=True,
@@ -35,14 +36,12 @@ class AccountPayment(models.Model):
     def _onchange_is_internal_transfer(self):
         for rec in self:
             if rec.is_internal_transfer:
-                rec.partner_id = False
+                internal_partner = rec._get_internal_transfer_partner()
+                rec.partner_id = internal_partner
+                rec.partner_type = "supplier"
+                rec.payment_type = "outbound"
                 if "partner_bank_id" in rec._fields:
                     rec.partner_bank_id = False
-                if "partner_type" in rec._fields:
-                    rec.partner_type = False
-                # El origen debe salir como pago saliente; el espejo entrante se crea automaticamente.
-                if "payment_type" in rec._fields and rec.payment_type not in ("outbound", "inbound"):
-                    rec.payment_type = "outbound"
             else:
                 rec.destination_journal_id = False
 
@@ -60,154 +59,149 @@ class AccountPayment(models.Model):
             }
         }
 
+    def _get_internal_transfer_partner(self):
+        self.ensure_one()
+        if not self.company_id.partner_id:
+            raise ValidationError(_("La compañía no tiene un contacto configurado."))
+        return self.company_id.partner_id
+        
     @api.constrains("is_internal_transfer", "journal_id", "destination_journal_id", "company_id")
     def _check_internal_transfer_configuration(self):
         for rec in self.filtered("is_internal_transfer"):
             if not rec.journal_id:
-                raise ValidationError(_("Debe seleccionar un diario origen para la transferencia interna."))
+                raise ValidationError(_("Debe seleccionar un diario origen."))
             if not rec.destination_journal_id:
-                raise ValidationError(_("Debe seleccionar un diario de destino para la transferencia interna."))
+                raise ValidationError(_("Debe seleccionar un diario destino."))
             if rec.journal_id == rec.destination_journal_id:
-                raise ValidationError(_("El diario origen y el diario destino deben ser distintos."))
+                raise ValidationError(_("El diario origen y destino deben ser diferentes."))
             if rec.journal_id.company_id != rec.destination_journal_id.company_id:
-                raise ValidationError(_("La transferencia interna debe realizarse entre diarios de la misma compania."))
+                raise ValidationError(_("Los diarios deben pertenecer a la misma compañía."))
             if rec.journal_id.type not in ("bank", "cash") or rec.destination_journal_id.type not in ("bank", "cash"):
-                raise ValidationError(_("Solo se permiten diarios de tipo banco o caja para transferencias internas."))
+                raise ValidationError(_("Solo se permiten diarios de banco o caja."))
+            if not rec.company_id.transfer_account_id:
+                raise ValidationError(_("Configura la cuenta de transferencia interna en la compañía."))
 
-    def _get_internal_transfer_account(self):
-        self.ensure_one()
-        company = self.company_id
-        for attr in (
-            "transfer_account_id",
-            "internal_transfer_account_id",
-            "account_journal_payment_transfer_account_id",
-        ):
-            if attr in company._fields:
-                account = company[attr]
-                if account:
-                    return account
-        return self.env["account.account"]
+    @api.depends("journal_id", "partner_id", "partner_type", "is_internal_transfer", "company_id")
+    def _compute_destination_account_id(self):
+        super()._compute_destination_account_id()
+        for pay in self:
+            if pay.is_internal_transfer:
+                pay.destination_account_id = pay.company_id.transfer_account_id
+
+    def _prepare_move_liquidity_lines(self, default_values):
+        lines = super()._prepare_move_liquidity_lines(default_values)
+        if self.is_internal_transfer:
+            for line in lines:
+                line["partner_id"] = False
+        return lines
+
+    def _prepare_move_counterpart_lines(self, default_values):
+        lines = super()._prepare_move_counterpart_lines(default_values)
+        if self.is_internal_transfer:
+            for line in lines:
+                line["partner_id"] = False
+                line["account_id"] = self.company_id.transfer_account_id.id
+        return lines
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        for vals in vals_list:
+            if vals.get("is_internal_transfer"):
+                company = self.env["res.company"].browse(vals.get("company_id")) if vals.get("company_id") else self.env.company
+                if not company.partner_id:
+                    raise ValidationError(_("La compañía no tiene un contacto configurado."))
+                vals["partner_id"] = company.partner_id.id
+                vals["partner_type"] = vals.get("partner_type") or "supplier"
+                vals["payment_type"] = "outbound"
+        return super().create(vals_list)
+    
+    def write(self, vals):
+        vals = dict(vals)
+        for rec in self:
+            if vals.get("is_internal_transfer") or rec.is_internal_transfer:
+                company = rec.company_id or self.env.company
+                if not vals.get("company_id") and company.partner_id:
+                    vals.setdefault("partner_id", company.partner_id.id)
+                vals.setdefault("partner_type", "supplier")
+                vals.setdefault("payment_type", "outbound")
+        return super().write(vals)
 
     def _prepare_internal_transfer_pair_vals(self):
         self.ensure_one()
-        vals = {
-            "payment_type": "inbound" if self.payment_type == "outbound" else "outbound",
-            "amount": self.amount,
-            "date": getattr(self, "date", False) or getattr(self, "payment_date", False),
-            "payment_date": getattr(self, "payment_date", False) or getattr(self, "date", False),
-            "memo": getattr(self, "memo", False) or getattr(self, "communication", False) or _("Transferencia interna: %s") % (self.display_name,),
-            "communication": getattr(self, "communication", False) or getattr(self, "memo", False) or _("Transferencia interna: %s") % (self.display_name,),
-            "journal_id": self.destination_journal_id.id,
-            "destination_journal_id": self.journal_id.id,
-            "currency_id": self.currency_id.id,
-            "company_id": self.company_id.id,
-            "is_internal_transfer": True,
-            "paired_internal_transfer_payment_id": self.id,
-            "internal_transfer_pair_created": True,
-            "partner_id": False,
-        }
-        if "partner_type" in self._fields:
-            vals["partner_type"] = False
-        if "payment_method_line_id" in self._fields and self.payment_method_line_id:
-            line = self.destination_journal_id.inbound_payment_method_line_ids[:1]
-            if line:
-                vals["payment_method_line_id"] = line.id
-        elif "payment_method_id" in self._fields and self.payment_method_id:
-            vals["payment_method_id"] = self.payment_method_id.id
-
-        transfer_account = self._get_internal_transfer_account()
-        if transfer_account and "destination_account_id" in self._fields:
-            vals["destination_account_id"] = transfer_account.id
-        return vals
-
-    @api.depends_context('uid')
-    def _compute_destination_account_id(self):
-        """Fuerza la cuenta puente en transferencias internas para evitar CxC/CxP."""
-        try:
-            super()._compute_destination_account_id()
-        except Exception:
-            # En algunas variantes el campo puede no tener super compatible.
-            pass
-        for rec in self.filtered("is_internal_transfer"):
-            transfer_account = rec._get_internal_transfer_account()
-            if transfer_account:
-                rec.destination_account_id = transfer_account
-
-    def _synchronize_to_moves(self, changed_fields):
-        # Dejar que el core sincronice, pero mantener la cuenta destino correcta.
-        res = super()._synchronize_to_moves(changed_fields)
-        for rec in self.filtered(lambda p: p.is_internal_transfer and p.state == 'draft'):
-            transfer_account = rec._get_internal_transfer_account()
-            if transfer_account and rec.move_id:
-                lines = rec.move_id.line_ids.filtered(lambda l: not l.display_type and l.account_id != transfer_account)
-                counterpart = rec.move_id.line_ids.filtered(lambda l: not l.display_type and l.account_id == rec.destination_account_id)
-                if counterpart:
-                    counterpart.account_id = transfer_account
-        return res
-
-    def _create_paired_internal_transfer_payment_fallback(self):
-        for rec in self.filtered(lambda p: p.is_internal_transfer and not p.paired_internal_transfer_payment_id and p.state == "posted"):
-            pair_vals = rec._prepare_internal_transfer_pair_vals()
-            pair = self.with_context(skip_internal_transfer_pair=True).create(pair_vals)
-            pair.action_post()
-            rec.write({
-                "paired_internal_transfer_payment_id": pair.id,
-                "internal_transfer_pair_created": True,
-            })
-            pair.write({
-                "paired_internal_transfer_payment_id": rec.id,
-            })
-            rec._reconcile_internal_transfer_with_pair(pair)
-
-    def _reconcile_internal_transfer_with_pair(self, pair=None):
-        for rec in self:
-            pair = pair or rec.paired_internal_transfer_payment_id
-            transfer_account = rec._get_internal_transfer_account()
-            if not pair or not transfer_account or not rec.move_id or not pair.move_id:
-                continue
-            lines = (rec.move_id.line_ids | pair.move_id.line_ids).filtered(
-                lambda l: not l.reconciled and not l.display_type and l.account_id == transfer_account
+    
+        inbound_method_line = self.destination_journal_id.inbound_payment_method_line_ids[:1]
+        if not inbound_method_line:
+            raise UserError(
+                _("El diario destino %s no tiene método de pago de entrada configurado.")
+                % self.destination_journal_id.display_name
             )
-            if len(lines) >= 2:
-                try:
-                    lines.reconcile()
-                except Exception:
-                    pass
+    
+        internal_partner = self.company_id.partner_id
+        if not internal_partner:
+            raise ValidationError(_("La compañía no tiene un contacto configurado."))
+    
+        return {
+            "date": self.date,
+            "journal_id": self.destination_journal_id.id,
+            "company_id": self.company_id.id,
+            "payment_type": "inbound",
+            "partner_type": "customer",
+            "partner_id": internal_partner.id,
+            "amount": self.amount,
+            "currency_id": self.currency_id.id,
+            "memo": self.memo or _("Transferencia interna desde %s") % self.journal_id.display_name,
+            "payment_method_line_id": inbound_method_line.id,
+            "is_internal_transfer": False,
+            "destination_account_id": self.company_id.transfer_account_id.id,
+            "paired_internal_transfer_payment_id": self.id,
+        }
+
+    def _post_internal_transfer_links_to_chatter(self, other_payment):
+        self.ensure_one()
+    
+        payment_link = Markup(
+            '<a href="/web#id=%s&model=account.payment&view_type=form">%s</a>'
+        ) % (other_payment.id, other_payment.display_name)
+    
+        body = Markup("Se ha creado un segundo pago: %s") % payment_link
+    
+        if other_payment.move_id:
+            move_link = Markup(
+                '<a href="/web#id=%s&model=account.move&view_type=form">%s</a>'
+            ) % (other_payment.move_id.id, other_payment.move_id.display_name)
+    
+            body += Markup("<br/>Se ha generado el asiento: %s") % move_link
+    
+        self.message_post(
+            body=body,
+            subtype_xmlid="mail.mt_note",
+        )
+        
+    def _create_internal_transfer_pair(self):
+        for pay in self.filtered(lambda p: p.is_internal_transfer and not p.paired_internal_transfer_payment_id):
+            pair_vals = pay._prepare_internal_transfer_pair_vals()
+            pair = self.env["account.payment"].create(pair_vals)
+    
+            pay.paired_internal_transfer_payment_id = pair.id
+            pay.internal_transfer_pair_created = True
+    
+            pair.action_post()
+    
+            counterpart_origin = pay.move_id.line_ids.filtered(
+                lambda l: l.account_id == pay.company_id.transfer_account_id and not l.reconciled
+            )
+            counterpart_pair = pair.move_id.line_ids.filtered(
+                lambda l: l.account_id == pay.company_id.transfer_account_id and not l.reconciled
+            )
+    
+            lines_to_reconcile = counterpart_origin | counterpart_pair
+            if len(lines_to_reconcile) >= 2:
+                lines_to_reconcile.reconcile()
+    
+            pay._post_internal_transfer_links_to_chatter(pair)
+            pair._post_internal_transfer_links_to_chatter(pay)
 
     def action_post(self):
-        for rec in self.filtered("is_internal_transfer"):
-            if "partner_id" in rec._fields:
-                rec.partner_id = False
-            if "partner_type" in rec._fields:
-                rec.partner_type = False
         res = super().action_post()
-        if self.env.context.get("skip_internal_transfer_pair"):
-            return res
-        transfers = self.filtered(lambda p: p.is_internal_transfer and not p.paired_internal_transfer_payment_id)
-        for rec in transfers:
-            core_method = getattr(rec, "_create_paired_internal_transfer_payment", None)
-            if callable(core_method):
-                before_pair = rec.paired_internal_transfer_payment_id
-                try:
-                    core_method()
-                except Exception:
-                    before_pair = False
-                rec.invalidate_recordset(["paired_internal_transfer_payment_id"])
-                if rec.paired_internal_transfer_payment_id or before_pair:
-                    rec.internal_transfer_pair_created = True
-                    rec._reconcile_internal_transfer_with_pair()
-                    continue
-            rec._create_paired_internal_transfer_payment_fallback()
+        self.filtered(lambda p: p.is_internal_transfer and not p.internal_transfer_pair_created)._create_internal_transfer_pair()
         return res
-
-    def action_draft(self):
-        for rec in self.filtered(lambda p: p.is_internal_transfer and p.paired_internal_transfer_payment_id and p.paired_internal_transfer_payment_id.state == "posted"):
-            if not self.env.context.get("skip_internal_transfer_pair"):
-                rec.paired_internal_transfer_payment_id.with_context(skip_internal_transfer_pair=True).action_draft()
-        return super().action_draft()
-
-    def action_cancel(self):
-        for rec in self.filtered(lambda p: p.is_internal_transfer and p.paired_internal_transfer_payment_id and p.paired_internal_transfer_payment_id.state not in ("cancel",)):
-            if not self.env.context.get("skip_internal_transfer_pair"):
-                rec.paired_internal_transfer_payment_id.with_context(skip_internal_transfer_pair=True).action_cancel()
-        return super().action_cancel()

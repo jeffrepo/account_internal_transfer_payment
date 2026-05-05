@@ -10,7 +10,7 @@ First functional draft for Odoo 19.
 - Tries to leverage native paired-payment logic when available
 """,
     "category": "Accounting/Accounting",
-    "author": "OpenAI",
+    "author": "Silva Technologies",
     "license": "LGPL-3",
     "depends": ["account"],
     "data": [
