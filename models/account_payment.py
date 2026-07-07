@@ -59,6 +59,63 @@ class AccountPayment(models.Model):
             }
         }
 
+    def _is_internal_transfer_flow(self):
+        self.ensure_one()
+        return bool(self.is_internal_transfer or self.paired_internal_transfer_payment_id)
+    
+    @api.depends("company_id", "partner_id", "payment_type", "is_internal_transfer", "paired_internal_transfer_payment_id")
+    def _compute_journal_id(self):
+        normal_payments = self.filtered(lambda p: not (p.is_internal_transfer or p.paired_internal_transfer_payment_id))
+        if normal_payments:
+            super(AccountPayment, normal_payments)._compute_journal_id()
+
+        internal_payments = self - normal_payments
+        for pay in internal_payments:
+            company = pay.company_id or self.env.company
+
+            # Si ya tiene diario seleccionado y pertenece a la compañía, NO lo sobreescribas
+            if pay.journal_id and pay.journal_id.company_id == company:
+                continue
+
+            # Si viene de un registro ya existente, conserva su diario original
+            if pay._origin and pay._origin.journal_id and pay._origin.journal_id.company_id == company:
+                pay.journal_id = pay._origin.journal_id
+                continue
+
+            # Fallback únicamente si no hay diario
+            pay.journal_id = self.env["account.journal"].search([
+                *self.env["account.journal"]._check_company_domain(company),
+                ("type", "in", ("bank", "cash")),
+            ], limit=1)
+
+    @api.depends("available_payment_method_line_ids", "payment_type", "journal_id", "is_internal_transfer", "paired_internal_transfer_payment_id")
+    def _compute_payment_method_line_id(self):
+        normal_payments = self.filtered(lambda p: not (p.is_internal_transfer or p.paired_internal_transfer_payment_id))
+        if normal_payments:
+            super(AccountPayment, normal_payments)._compute_payment_method_line_id()
+
+        internal_payments = self - normal_payments
+        for pay in internal_payments:
+            available = pay.available_payment_method_line_ids
+
+            # Si el actual sigue siendo válido, conservarlo
+            if pay.payment_method_line_id and pay.payment_method_line_id in available:
+                continue
+
+            if pay.payment_type == "outbound":
+                candidates = pay.journal_id.outbound_payment_method_line_ids
+            else:
+                candidates = pay.journal_id.inbound_payment_method_line_ids
+
+            candidates = candidates.filtered(lambda l: l in available)
+
+            if candidates:
+                pay.payment_method_line_id = candidates[0]
+            elif available:
+                pay.payment_method_line_id = available[0]
+            else:
+                pay.payment_method_line_id = False
+
     def _get_internal_transfer_partner(self):
         self.ensure_one()
         if not self.company_id.partner_id:
@@ -105,15 +162,16 @@ class AccountPayment(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        for vals in vals_list:
+        payments = super().create(vals_list)
+
+        for pay, vals in zip(payments, vals_list):
             if vals.get("is_internal_transfer"):
-                company = self.env["res.company"].browse(vals.get("company_id")) if vals.get("company_id") else self.env.company
-                if not company.partner_id:
-                    raise ValidationError(_("La compañía no tiene un contacto configurado."))
-                vals["partner_id"] = company.partner_id.id
-                vals["partner_type"] = vals.get("partner_type") or "supplier"
-                vals["payment_type"] = "outbound"
-        return super().create(vals_list)
+                if vals.get("journal_id"):
+                    pay.journal_id = vals["journal_id"]
+                if vals.get("payment_method_line_id"):
+                    pay.payment_method_line_id = vals["payment_method_line_id"]
+
+        return payments
     
     def write(self, vals):
         vals = dict(vals)
