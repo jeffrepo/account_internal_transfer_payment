@@ -140,6 +140,18 @@ class AccountPayment(models.Model):
         if not internal_partner:
             raise ValidationError(_("La compañía no tiene un contacto configurado."))
     
+        destination_currency = self.destination_journal_id.currency_id or self.company_id.currency_id
+    
+        if destination_currency == self.currency_id:
+            destination_amount = self.amount
+        else:
+            destination_amount = self.currency_id._convert(
+                self.amount,
+                destination_currency,
+                self.company_id,
+                self.date,
+            )
+    
         return {
             "date": self.date,
             "journal_id": self.destination_journal_id.id,
@@ -147,8 +159,8 @@ class AccountPayment(models.Model):
             "payment_type": "inbound",
             "partner_type": "customer",
             "partner_id": internal_partner.id,
-            "amount": self.amount,
-            "currency_id": self.currency_id.id,
+            "amount": destination_amount,
+            "currency_id": destination_currency.id,
             "memo": self.memo or _("Transferencia interna desde %s") % self.journal_id.display_name,
             "payment_method_line_id": inbound_method_line.id,
             "is_internal_transfer": False,
