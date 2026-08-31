@@ -152,33 +152,45 @@ class AccountPayment(models.Model):
                 % self.destination_journal_id.display_name
             )
 
-        configured_method_lines = inbound_method_lines.filtered("payment_account_id")
-        if not configured_method_lines:
-            raise UserError(
-                _(
-                    "Configura una cuenta transitoria en un método de pago de entrada "
-                    "del diario destino %s. Sin esa cuenta Odoo no puede generar el "
-                    "asiento ni la secuencia del pago espejo."
-                )
-                % self.destination_journal_id.display_name
-            )
-
-        manual_method_line = configured_method_lines.filtered(
+        manual_method_line = inbound_method_lines.filtered(
             lambda line: line.code == "manual"
         )[:1]
-        return manual_method_line or configured_method_lines[:1]
+        return manual_method_line or inbound_method_lines[:1]
 
     def _check_internal_transfer_move_configuration(self):
         for payment in self:
-            if not payment.outstanding_account_id:
+            transfer_account = payment.company_id.transfer_account_id
+            if not transfer_account:
                 raise UserError(
                     _(
-                        "Configura una cuenta transitoria en el método de pago %s "
-                        "del diario origen %s."
+                        "Configura la cuenta de transferencia interna en los "
+                        "ajustes de Contabilidad."
                     )
-                    % (
-                        payment.payment_method_line_id.display_name,
-                        payment.journal_id.display_name,
+                )
+            if not payment.journal_id.default_account_id:
+                raise UserError(
+                    _(
+                        "El diario origen %s no tiene una cuenta bancaria "
+                        "predeterminada configurada."
+                    )
+                    % payment.journal_id.display_name
+                )
+            if not payment.destination_journal_id.default_account_id:
+                raise UserError(
+                    _(
+                        "El diario destino %s no tiene una cuenta bancaria "
+                        "predeterminada configurada."
+                    )
+                    % payment.destination_journal_id.display_name
+                )
+            if transfer_account in (
+                payment.journal_id.default_account_id
+                | payment.destination_journal_id.default_account_id
+            ):
+                raise UserError(
+                    _(
+                        "La cuenta de transferencia interna debe ser diferente de "
+                        "las cuentas bancarias de los diarios origen y destino."
                     )
                 )
             payment._get_internal_transfer_inbound_method_line()
@@ -199,23 +211,48 @@ class AccountPayment(models.Model):
             if not rec.company_id.transfer_account_id:
                 raise ValidationError(_("Configura la cuenta de transferencia interna en la compañía."))
 
-    @api.depends("journal_id", "partner_id", "partner_type", "is_internal_transfer", "company_id")
+    @api.depends(
+        "payment_method_line_id",
+        "journal_id",
+        "is_internal_transfer",
+        "paired_internal_transfer_payment_id",
+    )
+    def _compute_outstanding_account_id(self):
+        normal_payments = self.filtered(
+            lambda payment: not payment._is_internal_transfer_flow()
+        )
+        if normal_payments:
+            super(AccountPayment, normal_payments)._compute_outstanding_account_id()
+
+        for payment in self - normal_payments:
+            # Post internal transfers directly bank-to-transfer-account. This
+            # avoids requiring outstanding accounts on payment method lines.
+            payment.outstanding_account_id = payment.journal_id.default_account_id
+
+    @api.depends(
+        "journal_id",
+        "partner_id",
+        "partner_type",
+        "is_internal_transfer",
+        "paired_internal_transfer_payment_id",
+        "company_id",
+    )
     def _compute_destination_account_id(self):
         super()._compute_destination_account_id()
         for pay in self:
-            if pay.is_internal_transfer:
+            if pay._is_internal_transfer_flow():
                 pay.destination_account_id = pay.company_id.transfer_account_id
 
     def _prepare_move_liquidity_lines(self, default_values):
         lines = super()._prepare_move_liquidity_lines(default_values)
-        if self.is_internal_transfer:
+        if self._is_internal_transfer_flow():
             for line in lines:
                 line["partner_id"] = False
         return lines
 
     def _prepare_move_counterpart_lines(self, default_values):
         lines = super()._prepare_move_counterpart_lines(default_values)
-        if self.is_internal_transfer:
+        if self._is_internal_transfer_flow():
             for line in lines:
                 line["partner_id"] = False
                 line["account_id"] = self.company_id.transfer_account_id.id
@@ -317,7 +354,7 @@ class AccountPayment(models.Model):
                 raise UserError(
                     _(
                         "No se pudo generar el asiento del pago espejo en el diario %s. "
-                        "Revisa su método de pago de entrada y su cuenta transitoria."
+                        "Revisa la cuenta bancaria predeterminada del diario."
                     )
                     % pair.journal_id.display_name
                 )
@@ -348,8 +385,8 @@ class AccountPayment(models.Model):
         if internal_payments.filtered(lambda payment: not payment.move_id):
             raise UserError(
                 _(
-                    "No se pudo generar el asiento del pago origen. Revisa el método "
-                    "de pago y la cuenta transitoria del diario seleccionado."
+                    "No se pudo generar el asiento del pago origen. Revisa la cuenta "
+                    "bancaria predeterminada del diario seleccionado."
                 )
             )
         internal_payments._compute_name()

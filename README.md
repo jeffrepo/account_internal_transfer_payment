@@ -14,7 +14,7 @@ Recuperar una experiencia parecida a Odoo 15 en la pantalla de pagos:
 - agrega vista heredada del formulario de pagos
 - valida que origen y destino sean diarios tipo banco/caja de la misma compania
 - usa en ambos pagos el numero contable generado por la secuencia de su diario
-- exige cuentas transitorias para garantizar que ambos pagos tengan asiento contable
+- contabiliza directamente en la cuenta bancaria de cada diario contra la cuenta de transferencia interna de la compania
 - intenta reutilizar el metodo nativo `_create_paired_internal_transfer_payment` si existe en el core
 - si el core no genera el par, intenta una creacion fallback
 
