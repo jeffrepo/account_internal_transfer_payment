@@ -13,6 +13,7 @@ Recuperar una experiencia parecida a Odoo 15 en la pantalla de pagos:
 - agrega campos a `account.payment`
 - agrega vista heredada del formulario de pagos
 - valida que origen y destino sean diarios tipo banco/caja de la misma compania
+- usa en ambos pagos el numero contable generado por la secuencia de su diario
 - intenta reutilizar el metodo nativo `_create_paired_internal_transfer_payment` si existe en el core
 - si el core no genera el par, intenta una creacion fallback
 

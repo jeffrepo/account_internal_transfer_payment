@@ -62,6 +62,26 @@ class AccountPayment(models.Model):
     def _is_internal_transfer_flow(self):
         self.ensure_one()
         return bool(self.is_internal_transfer or self.paired_internal_transfer_payment_id)
+
+    @api.depends(
+        "move_id.name",
+        "state",
+        "is_internal_transfer",
+        "paired_internal_transfer_payment_id",
+    )
+    def _compute_name(self):
+        normal_payments = self.filtered(
+            lambda payment: not payment._is_internal_transfer_flow()
+        )
+        if normal_payments:
+            super(AccountPayment, normal_payments)._compute_name()
+
+        for payment in self - normal_payments:
+            if payment.state not in ("in_process", "paid"):
+                continue
+
+            move_name = payment.move_id.name
+            payment.name = move_name if move_name and move_name != "/" else False
     
     @api.depends("company_id", "partner_id", "payment_type", "is_internal_transfer", "paired_internal_transfer_payment_id")
     def _compute_journal_id(self):
