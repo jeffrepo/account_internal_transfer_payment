@@ -1,6 +1,6 @@
 {
     "name": "Account Internal Transfer Payment",
-    "version": "19.0.1.0.1",
+    "version": "19.0.1.0.2",
     "summary": "Reintroduce internal transfer fields in payments form",
     "description": """
 First functional draft for Odoo 19.

@@ -141,6 +141,47 @@ class AccountPayment(models.Model):
         if not self.company_id.partner_id:
             raise ValidationError(_("La compañía no tiene un contacto configurado."))
         return self.company_id.partner_id
+
+    def _get_internal_transfer_inbound_method_line(self):
+        self.ensure_one()
+
+        inbound_method_lines = self.destination_journal_id.inbound_payment_method_line_ids
+        if not inbound_method_lines:
+            raise UserError(
+                _("El diario destino %s no tiene método de pago de entrada configurado.")
+                % self.destination_journal_id.display_name
+            )
+
+        configured_method_lines = inbound_method_lines.filtered("payment_account_id")
+        if not configured_method_lines:
+            raise UserError(
+                _(
+                    "Configura una cuenta transitoria en un método de pago de entrada "
+                    "del diario destino %s. Sin esa cuenta Odoo no puede generar el "
+                    "asiento ni la secuencia del pago espejo."
+                )
+                % self.destination_journal_id.display_name
+            )
+
+        manual_method_line = configured_method_lines.filtered(
+            lambda line: line.code == "manual"
+        )[:1]
+        return manual_method_line or configured_method_lines[:1]
+
+    def _check_internal_transfer_move_configuration(self):
+        for payment in self:
+            if not payment.outstanding_account_id:
+                raise UserError(
+                    _(
+                        "Configura una cuenta transitoria en el método de pago %s "
+                        "del diario origen %s."
+                    )
+                    % (
+                        payment.payment_method_line_id.display_name,
+                        payment.journal_id.display_name,
+                    )
+                )
+            payment._get_internal_transfer_inbound_method_line()
         
     @api.constrains("is_internal_transfer", "journal_id", "destination_journal_id", "company_id")
     def _check_internal_transfer_configuration(self):
@@ -206,13 +247,8 @@ class AccountPayment(models.Model):
 
     def _prepare_internal_transfer_pair_vals(self):
         self.ensure_one()
-    
-        inbound_method_line = self.destination_journal_id.inbound_payment_method_line_ids[:1]
-        if not inbound_method_line:
-            raise UserError(
-                _("El diario destino %s no tiene método de pago de entrada configurado.")
-                % self.destination_journal_id.display_name
-            )
+
+        inbound_method_line = self._get_internal_transfer_inbound_method_line()
     
         internal_partner = self.company_id.partner_id
         if not internal_partner:
@@ -276,6 +312,16 @@ class AccountPayment(models.Model):
             pay.internal_transfer_pair_created = True
     
             pair.action_post()
+
+            if not pair.move_id:
+                raise UserError(
+                    _(
+                        "No se pudo generar el asiento del pago espejo en el diario %s. "
+                        "Revisa su método de pago de entrada y su cuenta transitoria."
+                    )
+                    % pair.journal_id.display_name
+                )
+            pair._compute_name()
     
             counterpart_origin = pay.move_id.line_ids.filtered(
                 lambda l: l.account_id == pay.company_id.transfer_account_id and not l.reconciled
@@ -292,6 +338,20 @@ class AccountPayment(models.Model):
             pair._post_internal_transfer_links_to_chatter(pay)
 
     def action_post(self):
+        internal_payments = self.filtered(
+            lambda payment: payment.is_internal_transfer
+            and not payment.internal_transfer_pair_created
+        )
+        internal_payments._check_internal_transfer_move_configuration()
+
         res = super().action_post()
-        self.filtered(lambda p: p.is_internal_transfer and not p.internal_transfer_pair_created)._create_internal_transfer_pair()
+        if internal_payments.filtered(lambda payment: not payment.move_id):
+            raise UserError(
+                _(
+                    "No se pudo generar el asiento del pago origen. Revisa el método "
+                    "de pago y la cuenta transitoria del diario seleccionado."
+                )
+            )
+        internal_payments._compute_name()
+        internal_payments._create_internal_transfer_pair()
         return res
